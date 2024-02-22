@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -35,7 +38,7 @@ type Stats struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go-profile <command> [arguments]")
+		fmt.Fprintf(os.Stderr, "Usage: go-profile <command> [arguments]\n")
 		os.Exit(1)
 	}
 
@@ -45,9 +48,35 @@ func main() {
 	// CPU usage statistics
 	prev, err := getCPUTime()
 	if err != nil {
-		fmt.Printf("Failed to get CPU time: %s\n", err)
+		fmt.Fprintf(os.Stderr, "[go-profile] Failed to get CPU time: %s\n", err)
 		os.Exit(1)
 	}
+
+	// Aggregate statistics
+	totalTicks := uint64(0)
+	minCpu, maxCpu, sumCpu := 100.0, 0.0, 0.0
+	minRam, maxRam, sumRam := ^uint64(0), uint64(0), uint64(0)
+	minGpu, maxGpu, sumGpu := 100.0, 0.0, 0.0
+
+	// Create the log file (append)
+	log, err := os.OpenFile("go-profile.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[go-profile] Failed to open log file: %s\n", err)
+		os.Exit(1)
+	}
+	defer log.Close()
+
+	logPrintf := func(format string, a ...interface{}) {
+		str := fmt.Sprintf("[%s][go-profile] %s\n",
+			time.Now().Format(time.StampMilli),
+			fmt.Sprintf(format, a...))
+		log.WriteString(str)
+		os.Stderr.WriteString(str)
+	}
+
+	log.WriteString("\n")
+	logPrintf("=========================================")
+	logPrintf("Starting command: %s", strings.Join(os.Args[1:], " "))
 
 	// Start the ticker in the background
 	tick := time.Millisecond * 250
@@ -58,11 +87,16 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
+				totalTicks++
+
 				stats := Stats{}
 				usage, err := getCPUUsage(prev)
 				if err == nil {
 					stats.CpuPercent = usage * 100.0
 				}
+				minCpu = min(minCpu, stats.CpuPercent)
+				maxCpu = max(maxCpu, stats.CpuPercent)
+				sumCpu += stats.CpuPercent
 
 				memory, err := getMemoryInfo()
 				if err == nil {
@@ -72,6 +106,9 @@ func main() {
 					stats.MemTotal = memory.Total
 					stats.MemUsed = used
 				}
+				minRam = min(minRam, stats.MemUsed)
+				maxRam = max(maxRam, stats.MemUsed)
+				sumRam += stats.MemUsed
 
 				if nvidiasmijson.HasNvidiaSmi() {
 					log := nvidiasmijson.XmlToObject(nvidiasmijson.RunNvidiaSmi())
@@ -80,14 +117,19 @@ func main() {
 						s := strings.Split(gpu.GpuUtil, " ")
 						util, err := strconv.ParseFloat(s[0], 64)
 						if err != nil {
-							fmt.Printf("Bad")
+							// Pretend the GPU is at 0% utilization
+							util = 0.0
 						}
 						total += util
 					}
 					stats.GpuPercent = total / float64(len(log.GPUS))
+					minGpu = min(minGpu, stats.GpuPercent)
+					maxGpu = max(maxGpu, stats.GpuPercent)
+					sumGpu += stats.GpuPercent
 				}
 
-				fmt.Fprintf(os.Stderr, "[go-profile] CPU:%.2f%% | Memory:%.2f%% (%s/%s) | GPU:%.2f%%\n",
+				// TODO: write to a separate log JSON?
+				logPrintf("CPU:%.2f%% | Memory:%.2f%% (%s/%s) | GPU:%.2f%%",
 					stats.CpuPercent,
 					stats.MemPercent,
 					humanize.IBytes(stats.MemUsed),
@@ -101,35 +143,105 @@ func main() {
 	}()
 
 	// Collect a baseline
-	fmt.Fprintf(os.Stderr, "[go-profile] Collecting baseline...\n")
+	logPrintf("Collecting baseline...")
 	time.Sleep(time.Second + tick + 1)
 
 	// Execute the command
 	cmd := exec.Command(os.Args[1], os.Args[2:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	// Create pipes to capture stdout and stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		logPrintf("Error creating stdout pipe: %v", err)
+		os.Exit(1)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		logPrintf("Error creating stderr pipe: %v", err)
+		os.Exit(1)
+	}
+
 	start := time.Now()
 	err = cmd.Start()
 	if err != nil {
-		fmt.Printf("Failed to start command: %s\n", err)
+		logPrintf("Failed to start command: %s", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "[go-profile] Started command!\n")
+	logPrintf("Started command!")
+
+	// Create wait group to wait for output goroutines
+	var wg sync.WaitGroup
+
+	// Handle stdout
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleOutput(stdout, "stdout", os.Stdout, log)
+	}()
+
+	// Handle stderr
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleOutput(stderr, "stderr", os.Stderr, log)
+	}()
+
+	// Wait for output goroutines to finish
+	wg.Wait()
 
 	// Wait for the command to finish
 	err = cmd.Wait()
-	if err != nil {
-		fmt.Printf("Command execution failed: %s\n", err)
-		os.Exit(1)
-	}
 
 	// Send signal to stop the ticker
 	close(done)
 
 	// Print the total execution time
 	elapsed := time.Since(start)
-	fmt.Printf("Total Execution Time: %s\n", elapsed)
+	logPrintf("-----------------------------------------")
+
+	// Print the aggregate stats
+	logPrintf("CPU (min: %.2f%%, max: %.2f%%, range: %.2f%%, avg: %.2f%%)",
+		minCpu,
+		maxCpu,
+		maxCpu-minCpu,
+		sumCpu/float64(totalTicks))
+	logPrintf("Memory (min: %s, max: %s, range: %s, avg: %s)",
+		humanize.IBytes(minRam),
+		humanize.IBytes(maxRam),
+		humanize.IBytes(maxRam-minRam),
+		humanize.IBytes(sumRam/totalTicks))
+	logPrintf("GPU (min: %.2f%%, max: %.2f%%, range: %.2f%% avg: %.2f%%)",
+		minGpu,
+		maxGpu,
+		maxGpu-minGpu,
+		sumGpu/float64(totalTicks))
+	logPrintf("Total Execution Time: %s", elapsed)
+	logPrintf("=============== FINISHED ================")
+
+	// Check the exit code
+	if err != nil {
+		logPrintf("Command execution failed: %s", err)
+		os.Exit(1)
+	}
+}
+
+func handleOutput(output io.Reader, name string, mirror *os.File, log *os.File) {
+	scanner := bufio.NewScanner(output)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		timestamp := time.Now().Format(time.StampMilli)
+
+		// Log to original output
+		fmt.Fprintf(mirror, "[%s][cmd-%s] %s\n", timestamp, name, line)
+
+		// Write to the log
+		fmt.Fprintf(log, "[%s][cmd-%s] %s\n", timestamp, name, line)
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(log, "[go-profile] Error reading %s: %v\n", name, err)
+	}
 }
 
 /*
