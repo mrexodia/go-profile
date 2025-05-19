@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,7 +38,12 @@ type Stats struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	if runtime.GOOS != "linux" {
+		fmt.Fprintf(os.Stderr, "[go-profile] Unsupported operating system: %s\n", runtime.GOOS)
+		os.Exit(1)
+	}
+
+	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" {
 		fmt.Fprintf(os.Stderr, "Usage: go-profile <command> [arguments]\n")
 		os.Exit(1)
 	}
@@ -57,6 +63,7 @@ func main() {
 	minCpu, maxCpu, sumCpu := 100.0, 0.0, 0.0
 	minRam, maxRam, sumRam := ^uint64(0), uint64(0), uint64(0)
 	minGpu, maxGpu, sumGpu := 100.0, 0.0, 0.0
+	hasNvidiaSmi := nvidiasmijson.HasNvidiaSmi()
 
 	// Create the log file (append)
 	log, err := os.OpenFile("go-profile.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0644)
@@ -72,6 +79,26 @@ func main() {
 			fmt.Sprintf(format, a...))
 		log.WriteString(str)
 		os.Stderr.WriteString(str)
+	}
+
+	logStats := func(stats *Stats) {
+		// TODO: write to a separate log JSON?
+		if hasNvidiaSmi {
+			logPrintf("CPU:%.2f%% | Memory:%.2f%% (%s/%s) | GPU:%.2f%%",
+				stats.CpuPercent,
+				stats.MemPercent,
+				humanize.IBytes(stats.MemUsed),
+				humanize.IBytes(stats.MemTotal),
+				stats.GpuPercent,
+			)
+		} else {
+			logPrintf("CPU:%.2f%% | Memory:%.2f%% (%s/%s)",
+				stats.CpuPercent,
+				stats.MemPercent,
+				humanize.IBytes(stats.MemUsed),
+				humanize.IBytes(stats.MemTotal),
+			)
+		}
 	}
 
 	log.WriteString("\n")
@@ -110,7 +137,7 @@ func main() {
 				maxRam = max(maxRam, stats.MemUsed)
 				sumRam += stats.MemUsed
 
-				if nvidiasmijson.HasNvidiaSmi() {
+				if hasNvidiaSmi {
 					log := nvidiasmijson.XmlToObject(nvidiasmijson.RunNvidiaSmi())
 					total := 0.0
 					for _, gpu := range log.GPUS {
@@ -127,14 +154,7 @@ func main() {
 					maxGpu = max(maxGpu, stats.GpuPercent)
 					sumGpu += stats.GpuPercent
 				}
-
-				// TODO: write to a separate log JSON?
-				logPrintf("CPU:%.2f%% | Memory:%.2f%% (%s/%s) | GPU:%.2f%%",
-					stats.CpuPercent,
-					stats.MemPercent,
-					humanize.IBytes(stats.MemUsed),
-					humanize.IBytes(stats.MemTotal),
-					stats.GpuPercent)
+				logStats(&stats)
 
 			case <-done:
 				return
@@ -205,17 +225,22 @@ func main() {
 		minCpu,
 		maxCpu,
 		maxCpu-minCpu,
-		sumCpu/float64(totalTicks))
+		sumCpu/float64(totalTicks),
+	)
 	logPrintf("Memory (min: %s, max: %s, range: %s, avg: %s)",
 		humanize.IBytes(minRam),
 		humanize.IBytes(maxRam),
 		humanize.IBytes(maxRam-minRam),
-		humanize.IBytes(sumRam/totalTicks))
-	logPrintf("GPU (min: %.2f%%, max: %.2f%%, range: %.2f%% avg: %.2f%%)",
-		minGpu,
-		maxGpu,
-		maxGpu-minGpu,
-		sumGpu/float64(totalTicks))
+		humanize.IBytes(sumRam/totalTicks),
+	)
+	if hasNvidiaSmi {
+		logPrintf("GPU (min: %.2f%%, max: %.2f%%, range: %.2f%% avg: %.2f%%)",
+			minGpu,
+			maxGpu,
+			maxGpu-minGpu,
+			sumGpu/float64(totalTicks),
+		)
+	}
 	logPrintf("Total Execution Time: %s", elapsed)
 	logPrintf("=============== FINISHED ================")
 
@@ -245,8 +270,7 @@ func handleOutput(output io.Reader, name string, mirror *os.File, log *os.File) 
 }
 
 /*
-	References:
-
+References:
 - https://colby.id.au/calculating-cpu-usage-from-proc-stat/
 - https://www.kernel.org/doc/Documentation/filesystems/proc.txt
 */
